@@ -84,9 +84,9 @@ var _COL_RED   = Color{200, 40, 40, 255}
 // ═══════════════════════════════════════════════════════════════
 
 var _cx = 0.0
-var _cy = 50000.0   // start in space above planet
+var _cy = 50000.0    // start in orbit above planet
 var _cz = 0.0
-var _pitch = 0.0    // up/down angle
+var _pitch = -1.3   // look down at planet from orbit (-75°)
 var _yaw = 0.0      // left/right angle
 var _roll = 0.0     // bank angle
 var _mouse_captured = 1
@@ -277,8 +277,8 @@ func render_planet() {
                 // Color by biome
                 col := biome_color(h)
 
-                // Draw terrain cube (scaled to planet size)
-                cs := _PLANET_RADIUS * 0.008  // cube size ~24 units at R=3000
+                // Draw terrain cube (sized to fill grid spacing at planet surface)
+                cs := _PLANET_RADIUS * 2.2 / float(_GRID)
                 DrawCube(v3(wx, wy, wz), cs, cs, cs, col)
 
                 j = j + 1
