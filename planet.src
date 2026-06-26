@@ -53,10 +53,11 @@ extern "raylib" {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════
 
-var _PLANET_RADIUS = 30.0
+var _PLANET_RADIUS = 3000.0
 var _GRID = 20          // grid resolution per cube face (20×20)
 var _SEA_LEVEL  = -0.02
-var _SEA_OFFSET = 0.02  // positive offset for comparison avoidance
+var _SEA_OFFSET = 0.02
+var _BASE_SPEED = 1500.0  // base flight speed (scaled for large planet)
 
 // Biome colors
 var _COL_OCEAN    = Color{15, 30, 80, 255}
@@ -84,6 +85,16 @@ var _pitch = 0.0    // up/down angle
 var _yaw = 0.0      // left/right angle
 var _roll = 0.0     // bank angle
 var _mouse_captured = 1
+// Camera direction vectors (computed once per frame, used by both movement and view)
+var _fwd_x = 0.0
+var _fwd_y = 0.0
+var _fwd_z = -1.0
+var _rgt_x = 1.0
+var _rgt_y = 0.0
+var _rgt_z = 0.0
+var _c_up_x = 0.0
+var _c_up_y = 1.0
+var _c_up_z = 0.0
 var _speed_mult = 1.0
 
 // ═══════════════════════════════════════════════════════════════
@@ -221,8 +232,8 @@ func render_planet() {
                 // Color by biome
                 col := biome_color(h)
 
-                // Draw terrain cube (ocean gets larger, flat cubes)
-                cs := 0.25  // cube size
+                // Draw terrain cube (scaled to planet size)
+                cs := _PLANET_RADIUS * 0.008  // cube size ~24 units at R=3000
                 DrawCube(v3(wx, wy, wz), cs, cs, cs, col)
 
                 j = j + 1
@@ -252,9 +263,8 @@ func render_atmosphere() {
 // ── Star field (simple distant grid) ──
 
 func render_stars() {
-    // Draw a few bright dots in the background as "stars"
-    // Using a large grid behind everything
-    DrawGrid(200, 80.0)
+    // Distant reference grid for spatial orientation
+    DrawGrid(500, 200.0)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -287,15 +297,15 @@ func render_hud() {
 
 func handle_flight(dt) (running) {
     running = 1
-    speed := dt * 15.0 * _speed_mult
+    speed := dt * _BASE_SPEED * _speed_mult
 
     // Speed adjust
-    if IsKeyPressed(61) { _speed_mult = _speed_mult * 2.0 }   // =
-    if IsKeyPressed(45) { _speed_mult = _speed_mult * 0.5 }   // -
+    if IsKeyPressed(61) { _speed_mult = _speed_mult * 2.0 }
+    if IsKeyPressed(45) { _speed_mult = _speed_mult * 0.5 }
     if _speed_mult < 0.125 { _speed_mult = 0.125 }
     if _speed_mult > 64.0 { _speed_mult = 64.0 }
 
-    // Mouse capture
+    // Mouse capture toggle
     if IsKeyPressed(256) {  // ESC
         if _mouse_captured == 1 { EnableCursor(); _mouse_captured = 0 }
         else { DisableCursor(); _mouse_captured = 1 }
@@ -305,46 +315,46 @@ func handle_flight(dt) (running) {
         running = 0; return
     }
 
+    // Mouse look — always active when captured, independent of keyboard
     if _mouse_captured == 1 {
         md := GetMouseDelta()
         _yaw = _yaw - float(md.x) * dt * 2.5
         _pitch = _pitch + float(md.y) * dt * 2.5
-        // Clamp pitch
         if _pitch > 1.5 { _pitch = 1.5 }
         if _pitch < (-1.5) { _pitch = -1.5 }
     }
 
     // Roll
-    if IsKeyDown(81) { _roll = _roll - dt * 2.0 }   // Q
-    if IsKeyDown(69) { _roll = _roll + dt * 2.0 }   // E
+    if IsKeyDown(81) { _roll = _roll - dt * 2.0 }
+    if IsKeyDown(69) { _roll = _roll + dt * 2.0 }
 
-    // Forward direction (pitch + yaw)
-    fwd_x := sin(_yaw) * cos(_pitch)
-    fwd_y := sin(_pitch)
-    fwd_z := -cos(_yaw) * cos(_pitch)
+    // Compute shared direction vectors from yaw/pitch/roll
+    _fwd_x = sin(_yaw) * cos(_pitch)
+    _fwd_y = sin(_pitch)
+    _fwd_z = -cos(_yaw) * cos(_pitch)
 
-    // Right direction (perpendicular to forward, in horizontal plane)
-    right_x := cos(_yaw)
-    right_y := 0.0
-    right_z := sin(_yaw)
+    _rgt_x = cos(_yaw)
+    _rgt_y = 0.0
+    _rgt_z = sin(_yaw)
 
-    // Up direction (cross product right × forward)
-    up_x := right_y * fwd_z - 0.0 * right_z
-    up_y := right_z * fwd_x - right_x * fwd_z
-    up_z := right_x * fwd_y - right_y * fwd_x
+    // Up = right × forward (approximate)
+    _c_up_x = _rgt_y * _fwd_z - 0.0 * _rgt_z
+    _c_up_y = _rgt_z * _fwd_x - _rgt_x * _fwd_z
+    _c_up_z = _rgt_x * _fwd_y - _rgt_y * _fwd_x
 
-    // Apply roll rotation to right and up vectors
+    // Apply roll to right and up
     cr := cos(_roll); sr := sin(_roll)
-    // Rotate right around forward
-    r2_x := right_x * cr + up_x * sr
-    r2_y := right_y * cr + up_y * sr
-    r2_z := right_z * cr + up_z * sr
-    // New up = rotated up
-    u2_x := -right_x * sr + up_x * cr
-    u2_y := -right_y * sr + up_y * cr
-    u2_z := -right_z * sr + up_z * cr
+    r2_x := _rgt_x * cr + _c_up_x * sr
+    r2_y := _rgt_y * cr + _c_up_y * sr
+    r2_z := _rgt_z * cr + _c_up_z * sr
+    u2_x := -_rgt_x * sr + _c_up_x * cr
+    u2_y := -_rgt_y * sr + _c_up_y * cr
+    u2_z := -_rgt_z * sr + _c_up_z * cr
 
-    // Movement
+    _rgt_x = r2_x; _rgt_y = r2_y; _rgt_z = r2_z
+    _c_up_x = u2_x; _c_up_y = u2_y; _c_up_z = u2_z
+
+    // Keyboard movement (independent of mouse)
     move_forward := 0.0; move_right := 0.0; move_up := 0.0
     if IsKeyDown(87) { move_forward = speed }       // W
     if IsKeyDown(83) { move_forward = -speed }       // S
@@ -353,9 +363,9 @@ func handle_flight(dt) (running) {
     if IsKeyDown(32) { move_up = speed }             // SPACE
     if IsKeyDown(341) { move_up = -speed }           // L-CTRL
 
-    _cx = _cx + fwd_x * move_forward + r2_x * move_right + u2_x * move_up
-    _cy = _cy + fwd_y * move_forward + r2_y * move_right + u2_y * move_up
-    _cz = _cz + fwd_z * move_forward + r2_z * move_right + u2_z * move_up
+    _cx = _cx + _fwd_x * move_forward + _rgt_x * move_right + _c_up_x * move_up
+    _cy = _cy + _fwd_y * move_forward + _rgt_y * move_right + _c_up_y * move_up
+    _cz = _cz + _fwd_z * move_forward + _rgt_z * move_right + _c_up_z * move_up
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -373,36 +383,10 @@ func main() {
         running := handle_flight(dt)
         if running == 0 { break }
 
-        // Build camera
-        fwd_x := sin(_yaw) * cos(_pitch)
-        fwd_y := sin(_pitch)
-        fwd_z := -cos(_yaw) * cos(_pitch)
-
-        right_x := cos(_yaw)
-        right_y := 0.0
-        right_z := sin(_yaw)
-
-        up_x := 0.0 * fwd_z - fwd_z * 0.0  // simplified up
-        up_y := right_z * fwd_x - right_x * fwd_z
-        up_z := right_x * fwd_y - 0.0 * right_y
-
-        cr := cos(_roll); sr := sin(_roll)
-        u2_x := -right_x * sr + up_x * cr
-        u2_y := -0.0 * sr + up_y * cr
-        u2_z := -right_z * sr + up_z * cr
-
-        // Normalize up vector before creating Vector3
-        umag := sqrt(u2_x*u2_x + u2_y*u2_y + u2_z*u2_z)
-        if umag > 0.001 {
-            u2_x = u2_x / umag
-            u2_y = u2_y / umag
-            u2_z = u2_z / umag
-        }
-
+        // Build camera from shared direction vectors
         cam_pos := v3(_cx, _cy, _cz)
-        cam_target := v3(_cx + fwd_x, _cy + fwd_y, _cz + fwd_z)
-        cam_up := v3(u2_x, u2_y, u2_z)
-
+        cam_target := v3(_cx + _fwd_x, _cy + _fwd_y, _cz + _fwd_z)
+        cam_up := v3(_c_up_x, _c_up_y, _c_up_z)
         cam := Camera3D{cam_pos, cam_target, cam_up, 75.0, 0}
 
         BeginDrawing()
