@@ -22,21 +22,27 @@ transition from orbit to surface.
 
 ## How it works
 
-**Terrain**: 6-faced cube-sphere grid (20×20 per face, 2,400 surface
-cubes). Each cube is displaced outward by a 4-octave sine-wave fbm
-function that produces continent-scale landmasses, mountain ranges,
-and ocean basins.
+**Terrain**: real 3D Perlin noise (`noise3`) layered into fbm, sampled on a
+6-faced cube-sphere (96×96 cells per face). A domain-warped continent layer,
+ridged-noise mountain belts masked to land, and a fine detail octave displace
+each surface point outward — seamless across cube faces because the height
+comes from the normalized 3D direction.
 
-**Biomes**: Height-mapped — deep ocean → shore/sand → grassland →
-forest → mountain rock → snow caps.
+**Rendering**: the whole planet is baked into **one GPU mesh** (~110k triangles)
+uploaded once. Per triangle a flat-shading sun term (surface normal · light) is
+written into the vertex colors, so relief reads with light and shadow — then it's
+a single `DrawModel` per frame, not thousands of cubes.
 
-**Atmosphere**: Wireframe sphere shells at the atmosphere edge and
-cloud layer altitude.
+**Biomes**: height + latitude ramp — depth-shaded ocean → shore → grassland →
+forest → rock → mountain → snow, with polar ice caps.
 
-**Flight**: 6-DOF camera with pitch, yaw, and roll. Altitude, speed,
-and zone indicator in the HUD.
+**Flight**: 6-DOF camera (pitch, yaw, roll) from orbit to the surface; altitude,
+speed, and zone in the HUD.
 
 ## Architecture
 
-Single MFL file (`planet.src`) compiled against raylib. No mesh
-manipulation — pure `DrawCube` calls for every terrain cell.
+Single MFL file (`planet.src`) compiled against raylib. The surface is a GPU
+mesh built with the pointer/array FFI (`alloc` + `poke_f32`/`poke_u8` → `Mesh` →
+`UploadMesh`/`LoadModelFromMesh`) — the same approach as the
+[cyberpunk demo](https://github.com/javimosch/machin-game-demo-cyberpunk)'s chunk
+terrain. `PLANET_SHOT=<prefix> ./planet-gen` auto-captures two views and exits.

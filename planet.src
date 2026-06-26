@@ -1,25 +1,28 @@
-// planet.src — procedural planet with seamless space-to-surface flight
+// planet.src — a procedural planet with seamless space-to-surface flight.
 // Built in MFL through raylib's C FFI.
 //
-// Controls:
-//   W/S       — fly forward/backward
-//   A/D       — strafe left/right
-//   SPACE/CTRL — ascend/descend
-//   Mouse     — pitch/yaw
-//   Q/E       — roll
-//   ESC       — release cursor
-//   TAB       — quit
+// The terrain is real 3D Perlin noise (noise3) layered into fbm — continents,
+// ridged mountain belts, and fine detail — sampled on a cube-sphere. The surface is
+// ONE GPU mesh: ~per-triangle flat shading (a baked sun term) is written into vertex
+// colors, uploaded once, and drawn each frame (not thousands of per-cell cubes). Polar
+// ice caps and depth-shaded oceans come from a height+latitude biome ramp.
 //
-// Build: cp ../machin-game-dungeon/build.sh . && ./build.sh
+// Controls:
+//   W/S — thrust   A/D — strafe   SPACE/CTRL — ascend/descend
+//   Mouse — look   Q/E — roll     ESC — release cursor   TAB — quit
+//
+// Build: ./build.sh
 
 extern "raylib" {
     header "raylib.h"
     link "raylib" link "GL" link "m" link "pthread" link "dl" link "rt" link "X11"
 
-    cstruct Color       { r u8 g u8 b u8 a u8 }
-    cstruct Vector2     { x f32 y f32 }
-    cstruct Vector3     { x f32 y f32 z f32 }
-    cstruct Camera3D    { position Vector3 target Vector3 up Vector3 fovy f32 projection i32 }
+    cstruct Color    { r u8 g u8 b u8 a u8 }
+    cstruct Vector2  { x f32 y f32 }
+    cstruct Vector3  { x f32 y f32 z f32 }
+    cstruct Camera3D { position Vector3 target Vector3 up Vector3 fovy f32 projection i32 }
+    cstruct Model    {}
+    cstruct Mesh     { vertexCount i32 triangleCount i32 vertices ptr colors ptr vaoId u32 vboId ptr }
 
     fn InitWindow(i32, i32, string)
     fn SetTargetFPS(i32)
@@ -31,66 +34,63 @@ extern "raylib" {
 
     fn BeginMode3D(Camera3D)
     fn EndMode3D()
-    fn DrawCube(Vector3, f32, f32, f32, Color)
     fn DrawSphere(Vector3, f32, Color)
     fn DrawSphereWires(Vector3, f32, i32, i32, Color)
-    fn DrawGrid(i32, f32)
+    fn DrawModel(Model, Vector3, f32, Color)
+    fn UploadMesh(Mesh*, bool)
+    fn LoadModelFromMesh(Mesh) Model
 
     fn IsKeyDown(i32) bool
     fn IsKeyPressed(i32) bool
     fn GetMouseDelta() Vector2
     fn DisableCursor()
     fn EnableCursor()
-
     fn GetFrameTime() float
 
     fn DrawText(string, i32, i32, i32, Color)
     fn DrawFPS(i32, i32)
-    fn DrawRectangle(i32, i32, i32, i32, Color)
+    fn TakeScreenshot(string)
 }
 
-// ═══════════════════════════════════════════════════════════════
-// CONSTANTS
-// ═══════════════════════════════════════════════════════════════
+extern "rlgl" {
+    fn rlDisableBackfaceCulling()
+}
+
+// ═══════════════════════════════════════════════════════════════ CONSTANTS
 
 var _PLANET_RADIUS = 300.0
-var _GRID = 48          // grid per cube face (48×48 × 6 faces = 13,824 cells)
-var _SEA_LEVEL  = -0.02
-var _SEA_OFFSET = 0.02
-var _BASE_SPEED = 200.0
+var _GRID = 96          // cells per cube face (96² × 2 tris × 6 faces ≈ 110k triangles)
+var _RELIEF = 0.11      // mountain height as a fraction of the radius
 
-// Biome colors
-var _COL_OCEAN_DEEP = Color{5, 15, 50, 255}
-var _COL_OCEAN      = Color{15, 35, 90, 255}
-var _COL_OCEAN_SHLW = Color{25, 50, 120, 255}
-var _COL_SHORE       = Color{210, 195, 150, 255}
-var _COL_GRASS_LOW   = Color{90, 155, 70, 255}
-var _COL_GRASS       = Color{60, 130, 50, 255}
-var _COL_FOREST      = Color{25, 80, 25, 255}
-var _COL_ROCK        = Color{130, 120, 110, 255}
-var _COL_MOUNTAIN    = Color{100, 90, 85, 255}
-var _COL_MOUNTAIN_HI = Color{80, 75, 70, 255}
-var _COL_SNOW        = Color{240, 240, 245, 255}
-var _COL_CLOUD    = Color{255, 255, 255, 50}
-var _COL_SKY      = Color{200, 220, 255, 50}
+// sun direction (pre-normalized) for the baked flat shading
+var _SUNX = 0.46
+var _SUNY = 0.79
+var _SUNZ = 0.41
 
+// biome palette
+var _COL_SHORE     = Color{214, 200, 150, 255}
+var _COL_GRASS_LOW = Color{96, 158, 72, 255}
+var _COL_GRASS     = Color{62, 132, 52, 255}
+var _COL_FOREST    = Color{34, 92, 40, 255}
+var _COL_ROCK      = Color{120, 110, 98, 255}
+var _COL_MOUNTAIN  = Color{96, 88, 82, 255}
+var _COL_SNOW      = Color{242, 244, 250, 255}
+var _COL_ICE       = Color{210, 226, 240, 255}
+
+var _COL_ATM   = Color{120, 170, 255, 16}
 var _COL_WHITE = Color{255, 255, 255, 255}
-var _COL_GRAY  = Color{180, 180, 180, 255}
-var _COL_GREEN = Color{80, 200, 80, 255}
-var _COL_RED   = Color{200, 40, 40, 255}
+var _COL_GRAY  = Color{170, 175, 185, 255}
+var _COL_GREEN = Color{90, 210, 110, 255}
 
-// ═══════════════════════════════════════════════════════════════
-// CAMERA STATE
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════ CAMERA STATE
 
 var _cx = 0.0
-var _cy = 500.0     // start in orbit above planet
+var _cy = 520.0
 var _cz = 0.0
-var _pitch = -1.3   // look down at planet from orbit (-75°)
-var _yaw = 0.0      // left/right angle
-var _roll = 0.0     // bank angle
+var _pitch = -1.3
+var _yaw = 0.0
+var _roll = 0.0
 var _mouse_captured = 1
-// Camera direction vectors (computed once per frame, used by both movement and view)
 var _fwd_x = 0.0
 var _fwd_y = 0.0
 var _fwd_z = -1.0
@@ -101,259 +101,257 @@ var _c_up_x = 0.0
 var _c_up_y = 1.0
 var _c_up_z = 0.0
 var _speed_mult = 1.0
+var _BASE_SPEED = 200.0
 
-// ═══════════════════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════ HELPERS
 
 func v3(x, y, z) (v) { v = Vector3{x, y, z} }
+func clampf(v, lo, hi) (o) { o = v  if o < lo { o = lo }  if o > hi { o = hi } }
+func fabs(v) (o) { o = v  if v < 0.0 { o = 0.0 - v } }
 
-// ── 3D terrain height with domain warping + multi-octave fbm ──
+// ── noise: 3D Perlin layered into fbm (deterministic, seamless on a sphere) ──
 
-func terrain_height(px, py, pz) (h) {
-    mag := sqrt(px*px + py*py + pz*pz)
-    if mag < 0.001 { return }
-    nx := px / mag
-    ny := py / mag
-    nz := pz / mag
-
-    // Domain warp — distort input space to break regular sine patterns
-    wx := nx + sin(ny * 3.3 + nz * 2.1) * 0.7 + cos(nz * 4.5 + nx * 1.8) * 0.3
-    wy := ny + sin(nz * 3.3 + nx * 2.1) * 0.7 + cos(nx * 4.5 + ny * 1.8) * 0.3
-    wz := nz + sin(nx * 3.3 + ny * 2.1) * 0.7 + cos(ny * 4.5 + nz * 1.8) * 0.3
-
-    // ── Continent-scale landmasses (low freq, high amp) ──
-    h = sin(wx * 0.9 + wy * 0.6) * sin(wz * 0.8 + wx * 0.4) * 0.25
-    h = h + sin(ny * 1.1 + nz * 0.7) * cos(nx * 1.0 + ny * 0.5) * 0.18
-
-    // ── Mountain ridges (ridge noise: abs(sin) creates sharp crests) ──
-    r1 := sin(wx * 2.9 + wy * 1.8) * cos(wz * 2.5 + wy * 1.2)
-    r2 := sin(wz * 3.1 + wx * 2.0) * cos(wy * 2.7 + wx * 1.6)
-    ridge := abs(r1) * abs(r2) * 0.20
-    h = h + ridge
-
-    // ── Rolling hills ──
-    h = h + sin(wy * 4.5 + wx * 3.1) * cos(wz * 4.0 + ny * 2.5) * 0.10
-    h = h + sin(wx * 5.7 + wz * 4.2) * cos(wy * 5.0 + nx * 3.5) * 0.07
-
-    // ── Terrain detail octaves ──
-    h = h + sin(wx * 8.1 + wy * 6.5) * sin(wz * 7.8 + ny * 5.3) * 0.05
-    h = h + sin(wx * 13.3 + wz * 10.7) * cos(wy * 12.1 + nx * 9.5) * 0.03
-    h = h + sin(wz * 19.7 + wy * 16.3) * cos(wx * 18.5 + nz * 14.1) * 0.018
-    h = h + sin(nx * 28.1 + nz * 24.7) * sin(ny * 26.3 + nx * 20.5) * 0.01
-    h = h + sin(nx * 38.5) * cos(nz * 35.1) * sin(ny * 32.7) * 0.006
-
-    // ── Ocean basins (negative bias in some regions) ──
-    basin := sin(nx * 0.7) * sin(nz * 0.8) * cos(ny * 0.6) * 0.12
-    if -0.04 > basin { h = h + basin }
+func fbm3(x, y, z, oct) (s) {
+    s = 0.0
+    amp := 1.0
+    fr := 1.0
+    norm := 0.0
+    o := 0
+    while o < oct {
+        s = s + amp * noise3(x * fr, y * fr, z * fr)
+        norm = norm + amp
+        amp = amp * 0.5
+        fr = fr * 2.0
+        o = o + 1
+    }
+    if norm > 0.0 { s = s / norm }
 }
 
-// ── Height → biome color (12 zones) ──
+// terrain_height: elevation at a unit-sphere direction. Continents from low-freq fbm,
+// ridged mountain belts masked to land, plus fine detail. Ocean is everything < 0.
+func terrain_height(nx, ny, nz) (h) {
+    // domain warp to break up the grid feel of the noise
+    wx := nx + noise3(nx * 1.7 + 5.2, ny * 1.7, nz * 1.7) * 0.22
+    wy := ny + noise3(nx * 1.7, ny * 1.7 + 9.1, nz * 1.7) * 0.22
+    wz := nz + noise3(nx * 1.7, ny * 1.7, nz * 1.7 + 3.7) * 0.22
 
-func biome_color(h) (c) {
-    // Deep ocean
-    if h + _SEA_OFFSET < 0.0 {
-        d := (_SEA_LEVEL - h) * 150.0
-        if d > 50.0 { d = 50.0 }
-        r := int(5.0 - d * 0.05)
-        g := int(15.0 - d * 0.15)
-        bl := int(50.0 + d * 0.4)
-        if r < 3 { r = 3 }
-        if g < 5 { g = 5 }
-        if bl > 70 { bl = 70 }
-        c = Color{r, g, bl, 255}; return
+    cont := fbm3(wx * 1.3, wy * 1.3, wz * 1.3, 6)        // continents, ~[-1,1]
+    h = cont
+
+    land := clampf((cont + 0.04) * 4.0, 0.0, 1.0)        // 0 in ocean, 1 inland
+
+    m := fbm3(wx * 3.5 + 20.0, wy * 3.5, wz * 3.5 - 13.0, 5)
+    ridge := 1.0 - fabs(m)
+    ridge = ridge * ridge * ridge                        // sharpen into crests
+    h = h + ridge * 0.85 * land
+
+    h = h + fbm3(nx * 9.0, ny * 9.0, nz * 9.0, 3) * 0.09 * land
+}
+
+// ── height + latitude → biome color ──
+
+func biome_color(h, lat) (c) {
+    al := fabs(lat)
+    // polar caps (ice over sea, snow over land) — only very high latitudes
+    if al > 0.92 {
+        c = _COL_SNOW
+        if h <= 0.0 { c = _COL_ICE }
+        return
     }
-    // Shallow ocean
-    if _SEA_LEVEL + 0.01 > h {
-        c = _COL_OCEAN_SHLW; return
+    if al > 0.88 {
+        // a ragged transition band so the cap edge isn't a hard ring
+        if h > 0.05 { c = _COL_SNOW  return }
+        if h <= 0.0 { c = _COL_ICE  return }
     }
-    // Beach / shore
-    if _SEA_LEVEL + 0.04 > h {
-        c = _COL_SHORE; return
+    if h <= 0.0 {
+        // ocean: deeper = darker/bluer
+        d := clampf(0.0 - h, 0.0, 1.0)
+        r := int(22.0 - d * 16.0)
+        g := int(58.0 - d * 38.0)
+        b := int(120.0 - d * 60.0)
+        if r < 4 { r = 4 }
+        if g < 12 { g = 12 }
+        if b < 48 { b = 48 }
+        c = Color{r, g, b, 255}
+        return
     }
-    // Low grassland
-    if _SEA_LEVEL + 0.10 > h {
-        c = _COL_GRASS_LOW; return
-    }
-    // Grassland
-    if _SEA_LEVEL + 0.17 > h {
-        c = _COL_GRASS; return
-    }
-    // Forest
-    if _SEA_LEVEL + 0.25 > h {
-        c = _COL_FOREST; return
-    }
-    // Rocky foothills
-    if _SEA_LEVEL + 0.32 > h {
-        c = _COL_ROCK; return
-    }
-    // Mountain
-    if _SEA_LEVEL + 0.42 > h {
-        c = _COL_MOUNTAIN; return
-    }
-    // High mountain
-    if _SEA_LEVEL + 0.55 > h {
-        c = _COL_MOUNTAIN_HI; return
-    }
-    // Snow cap
+    if h < 0.02 { c = _COL_SHORE  return }
+    if h < 0.10 { c = _COL_GRASS_LOW  return }
+    if h < 0.24 { c = _COL_GRASS  return }
+    if h < 0.42 { c = _COL_FOREST  return }
+    if h < 0.62 { c = _COL_ROCK  return }
+    if h < 0.92 { c = _COL_MOUNTAIN  return }
     c = _COL_SNOW
 }
 
-// ═══════════════════════════════════════════════════════════════
-// PLANET RENDERING
-// ═══════════════════════════════════════════════════════════════
-
-// Cube-to-sphere point generation
-// Face 0:+X 1:-X 2:+Y 3:-Y 4:+Z 5:-Z
+// ═══════════════════════════════════════════════════════════════ CUBE-SPHERE MESH
 
 func face_normal(face) (nx, ny, nz) {
-    nx = 0.0; ny = 0.0; nz = 0.0
-    if face == 0 { nx = 1.0; return }
-    if face == 1 { nx = -1.0; return }
-    if face == 2 { ny = 1.0; return }
-    if face == 3 { ny = -1.0; return }
-    if face == 4 { nz = 1.0; return }
-    nz = -1.0  // face == 5
+    nx = 0.0  ny = 0.0  nz = 0.0
+    if face == 0 { nx = 1.0  return }
+    if face == 1 { nx = -1.0  return }
+    if face == 2 { ny = 1.0  return }
+    if face == 3 { ny = -1.0  return }
+    if face == 4 { nz = 1.0  return }
+    nz = -1.0
 }
-
 func face_tangents(face) (u1x, u1y, u1z, u2x, u2y, u2z) {
-    // Two perpendicular directions on the cube face
-    u1x = 0.0; u1y = 0.0; u1z = 0.0
-    u2x = 0.0; u2y = 0.0; u2z = 0.0
-
-    if face == 0 {      // +X: tangent Y, Z
-        u1y = 1.0; u2z = 1.0; return
-    }
-    if face == 1 {      // -X: tangent Y, Z
-        u1y = 1.0; u2z = 1.0; return
-    }
-    if face == 2 {      // +Y: tangent X, Z
-        u1x = 1.0; u2z = 1.0; return
-    }
-    if face == 3 {      // -Y: tangent X, Z
-        u1x = 1.0; u2z = 1.0; return
-    }
-    if face == 4 {      // +Z: tangent X, Y
-        u1x = 1.0; u2y = 1.0; return
-    }
-    // face == 5: -Z
-    u1x = 1.0; u2y = 1.0
+    u1x = 0.0  u1y = 0.0  u1z = 0.0  u2x = 0.0  u2y = 0.0  u2z = 0.0
+    if face == 0 { u1y = 1.0  u2z = 1.0  return }
+    if face == 1 { u1y = 1.0  u2z = 1.0  return }
+    if face == 2 { u1x = 1.0  u2z = 1.0  return }
+    if face == 3 { u1x = 1.0  u2z = 1.0  return }
+    if face == 4 { u1x = 1.0  u2y = 1.0  return }
+    u1x = 1.0  u2y = 1.0
 }
 
-func render_planet() {
+// surf maps a cube-face coordinate (a,b ∈ [-1,1]) to a world-space surface point + its
+// elevation. Oceans render flat at the sea-level radius; land rises by the relief factor.
+func surf(nx, ny, nz, u1x, u1y, u1z, u2x, u2y, u2z, a, b) (wx, wy, wz, h, sy) {
+    dx := nx + u1x * a + u2x * b
+    dy := ny + u1y * a + u2y * b
+    dz := nz + u1z * a + u2z * b
+    mag := sqrt(dx * dx + dy * dy + dz * dz)
+    sx := dx / mag
+    sy = dy / mag
+    sz := dz / mag
+    h = terrain_height(sx, sy, sz)
+    r := _PLANET_RADIUS
+    if h > 0.0 { r = _PLANET_RADIUS * (1.0 + h * _RELIEF) }
+    wx = sx * r
+    wy = sy * r
+    wz = sz * r
+}
+
+// put_tri writes 3 vertex positions (12 bytes each) + 3 identical vertex colors.
+func put_tri(vbuf, cbuf, vi, ax, ay, az, bx, by, bz, cx, cy, cz, r, g, b) (nvi) {
+    poke_f32(vbuf, vi * 12, ax)        poke_f32(vbuf, vi * 12 + 4, ay)        poke_f32(vbuf, vi * 12 + 8, az)
+    poke_f32(vbuf, (vi + 1) * 12, bx)  poke_f32(vbuf, (vi + 1) * 12 + 4, by)  poke_f32(vbuf, (vi + 1) * 12 + 8, bz)
+    poke_f32(vbuf, (vi + 2) * 12, cx)  poke_f32(vbuf, (vi + 2) * 12 + 4, cy)  poke_f32(vbuf, (vi + 2) * 12 + 8, cz)
+    k := 0
+    while k < 3 {
+        poke_u8(cbuf, (vi + k) * 4, r)  poke_u8(cbuf, (vi + k) * 4 + 1, g)  poke_u8(cbuf, (vi + k) * 4 + 2, b)  poke_u8(cbuf, (vi + k) * 4 + 3, 255)
+        k = k + 1
+    }
+    nvi = vi + 3
+}
+
+// tri_color: flat-shade a triangle — outward normal · sun (Lambert + ambient), times the
+// biome color picked from the average height + latitude.
+func tri_color(ax, ay, az, bx, by, bz, cx, cy, cz, h) (r, g, b) {
+    ex1 := bx - ax  ey1 := by - ay  ez1 := bz - az
+    ex2 := cx - ax  ey2 := cy - ay  ez2 := cz - az
+    nx := ey1 * ez2 - ez1 * ey2
+    ny := ez1 * ex2 - ex1 * ez2
+    nz := ex1 * ey2 - ey1 * ex2
+    ln := sqrt(nx * nx + ny * ny + nz * nz) + 0.00001
+    nx = nx / ln  ny = ny / ln  nz = nz / ln
+    // centroid (also gives the outward direction + latitude)
+    mx := (ax + bx + cx) / 3.0
+    my := (ay + by + cy) / 3.0
+    mz := (az + bz + cz) / 3.0
+    ml := sqrt(mx * mx + my * my + mz * mz) + 0.00001
+    if nx * mx + ny * my + nz * mz < 0.0 { nx = 0.0 - nx  ny = 0.0 - ny  nz = 0.0 - nz }
+    diff := nx * _SUNX + ny * _SUNY + nz * _SUNZ
+    if diff < 0.0 { diff = 0.0 }
+    sh := 0.32 + 0.68 * diff
+    col := biome_color(h, my / ml)
+    r = int(float(col.r) * sh)
+    g = int(float(col.g) * sh)
+    b = int(float(col.b) * sh)
+}
+
+// build_planet_mesh bakes the whole planet into one GPU mesh (built once at startup).
+func build_planet_mesh() (model) {
+    g := _GRID
+    vcount := g * g * 6 * 6
+    vbuf := alloc(vcount * 12)
+    cbuf := alloc(vcount * 4)
+    vi := 0
     face := 0
     while face < 6 {
         nx, ny, nz := face_normal(face)
         u1x, u1y, u1z, u2x, u2y, u2z := face_tangents(face)
 
-        i := 0
-        while i < _GRID {
-            // Map i from [0, GRID) to [-1, 1]
-            a := float(i) / float(_GRID - 1) * 2.0 - 1.0
-            j := 0
-            while j < _GRID {
-                b := float(j) / float(_GRID - 1) * 2.0 - 1.0
-
-                // Un-normalized direction on cube face
-                dx := nx + u1x * a + u2x * b
-                dy := ny + u1y * a + u2y * b
-                dz := nz + u1z * a + u2z * b
-
-                // Normalize to sphere surface
-                mag := sqrt(dx*dx + dy*dy + dz*dz)
-                sx := dx / mag
-                sy := dy / mag
-                sz := dz / mag
-
-                // Terrain height at this point on the sphere
-                h := terrain_height(sx, sy, sz)
-                r := _PLANET_RADIUS + h * _PLANET_RADIUS
-
-                // World position
-                wx := sx * r
-                wy := sy * r
-                wz := sz * r
-
-                // Color by biome
-                col := biome_color(h)
-
-                // Voxel cube — fills cell completely (no gaps)
-                cs := _PLANET_RADIUS * 2.05 / float(_GRID)
-                DrawCube(v3(wx, wy, wz), cs, cs, cs, col)
-
-                j = j + 1
+        // precompute the (g+1)² vertex grid for this face (no per-cell recompute)
+        px := []float{}  py := []float{}  pz := []float{}  ph := []float{}
+        jj := 0
+        while jj <= g {
+            ii := 0
+            while ii <= g {
+                a := float(ii) / float(g) * 2.0 - 1.0
+                b := float(jj) / float(g) * 2.0 - 1.0
+                wx, wy, wz, h, sy := surf(nx, ny, nz, u1x, u1y, u1z, u2x, u2y, u2z, a, b)
+                px = append(px, wx)  py = append(py, wy)  pz = append(pz, wz)  ph = append(ph, h)
+                ii = ii + 1
             }
-            i = i + 1
+            jj = jj + 1
+        }
+
+        row := g + 1
+        j := 0
+        while j < g {
+            i := 0
+            while i < g {
+                a00 := j * row + i
+                a10 := j * row + i + 1
+                a01 := (j + 1) * row + i
+                a11 := (j + 1) * row + i + 1
+
+                hA := (ph[a00] + ph[a10] + ph[a11]) / 3.0
+                rA, gA, bA := tri_color(px[a00], py[a00], pz[a00], px[a10], py[a10], pz[a10], px[a11], py[a11], pz[a11], hA)
+                vi = put_tri(vbuf, cbuf, vi, px[a00], py[a00], pz[a00], px[a10], py[a10], pz[a10], px[a11], py[a11], pz[a11], rA, gA, bA)
+
+                hB := (ph[a00] + ph[a11] + ph[a01]) / 3.0
+                rB, gB, bB := tri_color(px[a00], py[a00], pz[a00], px[a11], py[a11], pz[a11], px[a01], py[a01], pz[a01], hB)
+                vi = put_tri(vbuf, cbuf, vi, px[a00], py[a00], pz[a00], px[a11], py[a11], pz[a11], px[a01], py[a01], pz[a01], rB, gB, bB)
+                i = i + 1
+            }
+            j = j + 1
         }
         face = face + 1
     }
+    mesh := Mesh{vcount, vcount / 3, vbuf, cbuf, 0, 0}
+    UploadMesh(mesh, false)
+    model = LoadModelFromMesh(mesh)
 }
-
-// ── Atmosphere & effects ──
 
 func render_atmosphere() {
-    atm_r := _PLANET_RADIUS * 1.05
-    DrawSphereWires(v3(0.0, 0.0, 0.0), atm_r, 48, 48, _COL_SKY)
-    cloud_r := _PLANET_RADIUS * 1.01
-    DrawSphereWires(v3(0.0, 0.0, 0.0), cloud_r, 48, 48, _COL_CLOUD)
+    DrawSphereWires(v3(0.0, 0.0, 0.0), _PLANET_RADIUS * 1.04, 32, 32, _COL_ATM)
 }
 
-// ── Star field (simple distant grid) ──
-
-func render_stars() {
-    // Distant reference grid for spatial orientation
-    DrawGrid(50, 20.0)
-}
-
-// ═══════════════════════════════════════════════════════════════
-// HUD
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════ HUD
 
 func render_hud() {
-    // Altitude from planet center
-    dist := sqrt(_cx*_cx + _cy*_cy + _cz*_cz)
+    dist := sqrt(_cx * _cx + _cy * _cy + _cz * _cz)
     alt := dist - _PLANET_RADIUS
-    atmos_h := _PLANET_RADIUS * 0.08
-
     zone := "SPACE"
-    if alt < atmos_h { zone = "ATMOSPHERE" }
+    if alt < _PLANET_RADIUS * 0.10 { zone = "ATMOSPHERE" }
+    if alt < 2.0 { zone = "SURFACE" }
     if alt < 0.0 { zone = "UNDERGROUND" }
-
-    DrawText("ALT: " + str(int(alt)) + " m", 20, 20, 14, _COL_WHITE)
-    DrawText("DST: " + str(int(dist)) + " m", 20, 36, 14, _COL_GRAY)
-    DrawText("ZONE: " + zone, 20, 52, 14, _COL_GREEN)
-    DrawText("SPD: " + str(int(_speed_mult)), 20, 68, 14, _COL_GRAY)
-
-    DrawText("W/S=thrust A/D=strafe SPACE/CTRL=elev Q/E=roll", 180, 20, 14, _COL_GRAY)
-    DrawText("Mouse=look TAB=quit", 180, 36, 14, _COL_GRAY)
-    DrawFPS(750, 20)
+    DrawText("ALT: " + str(int(alt)) + " m", 20, 20, 16, _COL_WHITE)
+    DrawText("ZONE: " + zone, 20, 40, 16, _COL_GREEN)
+    DrawText("SPD x" + str(int(_speed_mult)), 20, 60, 16, _COL_GRAY)
+    DrawText("W/S thrust  A/D strafe  SPACE/CTRL elev  Q/E roll  +/- speed  TAB quit", 20, 744, 14, _COL_GRAY)
+    DrawFPS(940, 20)
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 6-DOF FLIGHT CONTROLS
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════ 6-DOF FLIGHT
 
 func handle_flight(dt) (running) {
     running = 1
     speed := dt * _BASE_SPEED * _speed_mult
 
-    // Speed adjust
     if IsKeyPressed(61) { _speed_mult = _speed_mult * 2.0 }
     if IsKeyPressed(45) { _speed_mult = _speed_mult * 0.5 }
     if _speed_mult < 0.125 { _speed_mult = 0.125 }
     if _speed_mult > 64.0 { _speed_mult = 64.0 }
 
-    // Mouse capture toggle
-    if IsKeyPressed(256) {  // ESC
-        if _mouse_captured == 1 { EnableCursor(); _mouse_captured = 0 }
-        else { DisableCursor(); _mouse_captured = 1 }
+    if IsKeyPressed(256) {
+        if _mouse_captured == 1 { EnableCursor()  _mouse_captured = 0 } else { DisableCursor()  _mouse_captured = 1 }
     }
+    if IsKeyDown(258) { running = 0  return }
 
-    if IsKeyDown(258) {  // TAB = quit
-        running = 0; return
-    }
-
-    // Mouse look — always active when captured, independent of keyboard
     if _mouse_captured == 1 {
         md := GetMouseDelta()
         _yaw = _yaw - float(md.x) * dt * 2.5
@@ -361,85 +359,85 @@ func handle_flight(dt) (running) {
         if _pitch > 1.5 { _pitch = 1.5 }
         if _pitch < (-1.5) { _pitch = -1.5 }
     }
-
-    // Roll
     if IsKeyDown(81) { _roll = _roll - dt * 2.0 }
     if IsKeyDown(69) { _roll = _roll + dt * 2.0 }
 
-    // Compute shared direction vectors from yaw/pitch/roll
     _fwd_x = sin(_yaw) * cos(_pitch)
     _fwd_y = sin(_pitch)
     _fwd_z = -cos(_yaw) * cos(_pitch)
-
     _rgt_x = cos(_yaw)
     _rgt_y = 0.0
     _rgt_z = sin(_yaw)
-
-    // Up = right × forward (approximate)
     _c_up_x = _rgt_y * _fwd_z - 0.0 * _rgt_z
     _c_up_y = _rgt_z * _fwd_x - _rgt_x * _fwd_z
     _c_up_z = _rgt_x * _fwd_y - _rgt_y * _fwd_x
 
-    // Apply roll to right and up
-    cr := cos(_roll); sr := sin(_roll)
+    cr := cos(_roll)  sr := sin(_roll)
     r2_x := _rgt_x * cr + _c_up_x * sr
     r2_y := _rgt_y * cr + _c_up_y * sr
     r2_z := _rgt_z * cr + _c_up_z * sr
     u2_x := -_rgt_x * sr + _c_up_x * cr
     u2_y := -_rgt_y * sr + _c_up_y * cr
     u2_z := -_rgt_z * sr + _c_up_z * cr
+    _rgt_x = r2_x  _rgt_y = r2_y  _rgt_z = r2_z
+    _c_up_x = u2_x  _c_up_y = u2_y  _c_up_z = u2_z
 
-    _rgt_x = r2_x; _rgt_y = r2_y; _rgt_z = r2_z
-    _c_up_x = u2_x; _c_up_y = u2_y; _c_up_z = u2_z
-
-    // Keyboard movement (independent of mouse)
-    move_forward := 0.0; move_right := 0.0; move_up := 0.0
-    if IsKeyDown(87) { move_forward = speed }       // W
-    if IsKeyDown(83) { move_forward = -speed }       // S
-    if IsKeyDown(65) { move_right = -speed }         // A
-    if IsKeyDown(68) { move_right = speed }          // D
-    if IsKeyDown(32) { move_up = speed }             // SPACE
-    if IsKeyDown(341) { move_up = -speed }           // L-CTRL
-
-    _cx = _cx + _fwd_x * move_forward + _rgt_x * move_right + _c_up_x * move_up
-    _cy = _cy + _fwd_y * move_forward + _rgt_y * move_right + _c_up_y * move_up
-    _cz = _cz + _fwd_z * move_forward + _rgt_z * move_right + _c_up_z * move_up
+    mf := 0.0  mr := 0.0  mu := 0.0
+    if IsKeyDown(87) { mf = speed }
+    if IsKeyDown(83) { mf = -speed }
+    if IsKeyDown(65) { mr = -speed }
+    if IsKeyDown(68) { mr = speed }
+    if IsKeyDown(32) { mu = speed }
+    if IsKeyDown(341) { mu = -speed }
+    _cx = _cx + _fwd_x * mf + _rgt_x * mr + _c_up_x * mu
+    _cy = _cy + _fwd_y * mf + _rgt_y * mr + _c_up_y * mu
+    _cz = _cz + _fwd_z * mf + _rgt_z * mr + _c_up_z * mu
 }
 
-// ═══════════════════════════════════════════════════════════════
-// MAIN
-// ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════ MAIN
 
 func main() {
     InitWindow(1024, 768, "planet-gen — procedural planet")
     SetTargetFPS(60)
     DisableCursor()
+    rlDisableBackfaceCulling()
+
+    planet := build_planet_mesh()        // bake the surface once
+
+    shot := env("PLANET_SHOT")           // non-empty => auto-capture two views and quit
+    frame := 0
 
     while WindowShouldClose() == false {
         dt := GetFrameTime()
 
-        running := handle_flight(dt)
-        if running == 0 { break }
+        cam := Camera3D{v3(_cx, _cy, _cz), v3(_cx + _fwd_x, _cy + _fwd_y, _cz + _fwd_z), v3(_c_up_x, _c_up_y, _c_up_z), 70.0, 0}
 
-        // Build camera from shared direction vectors
-        cam_pos := v3(_cx, _cy, _cz)
-        cam_target := v3(_cx + _fwd_x, _cy + _fwd_y, _cz + _fwd_z)
-        cam_up := v3(_c_up_x, _c_up_y, _c_up_z)
-        cam := Camera3D{cam_pos, cam_target, cam_up, 75.0, 0}
+        if shot != "" {
+            // scripted camera: a top-down orbit, then a 3/4 angle near the surface
+            if frame < 30 {
+                cam = Camera3D{v3(0.0, 540.0, 0.1), v3(0.0, 0.0, 0.0), v3(0.0, 0.0, -1.0), 70.0, 0}
+            } else {
+                cam = Camera3D{v3(330.0, 250.0, 330.0), v3(0.0, 0.0, 0.0), v3(0.0, 1.0, 0.0), 60.0, 0}
+            }
+        } else {
+            running := handle_flight(dt)
+            if running == 0 { break }
+        }
 
         BeginDrawing()
-        ClearBackground(Color{5, 5, 15, 255})  // deep space
-
+        ClearBackground(Color{6, 8, 18, 255})
         BeginMode3D(cam)
-
-        render_stars()
-        render_planet()
+        DrawModel(planet, v3(0.0, 0.0, 0.0), 1.0, _COL_WHITE)
         render_atmosphere()
-
         EndMode3D()
-
-        render_hud()
+        if shot == "" { render_hud() }
         EndDrawing()
+
+        if shot != "" {
+            if frame == 20 { TakeScreenshot(shot + "_orbit.png") }
+            if frame == 55 { TakeScreenshot(shot + "_angle.png")  break }
+        }
+        frame = frame + 1
     }
 
     EnableCursor()

@@ -2,3 +2,4 @@ vendor/
 *.mfl
 planet-gen
 __MACOSX/
+*.png
